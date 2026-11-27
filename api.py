@@ -940,6 +940,23 @@ async def _auto_title_session(session_id: str, user_id: int, first_message: str)
         logger.warning("会话标题更新失败: %s", e)
 
 
+def _translate_agent_error(exc: Exception) -> HTTPException:
+    """把 LLM 供应商异常翻译成稳定的 HTTP 语义。
+
+    为什么要单独翻译：原先把 SDK 异常原样塞进 500 的 detail，
+    前端只能看到一串「Error code: 429 ...」——既暴露内部实现，
+    又让「限流（可重试）」和「代码 bug（不可重试）」无法区分。
+    503/504 都是可重试语义，前端可据此提示用户稍后再试。
+    """
+    from openai import APITimeoutError, RateLimitError
+
+    if isinstance(exc, RateLimitError):
+        return HTTPException(status_code=503, detail="模型服务繁忙（触发限流），请稍后重试")
+    if isinstance(exc, APITimeoutError):
+        return HTTPException(status_code=504, detail="模型响应超时，请稍后重试")
+    return HTTPException(status_code=500, detail=f"Agent 处理失败: {exc}")
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, user_id: int = Depends(get_current_user)):
     try:
@@ -957,7 +974,7 @@ async def chat_endpoint(request: ChatRequest, user_id: int = Depends(get_current
             model_provider=request.model_provider,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent 处理失败: {str(e)}") from e
+        raise _translate_agent_error(e) from e
 
 
 @app.post("/chat/stream")
@@ -972,7 +989,8 @@ async def chat_stream_endpoint(request: ChatRequest, user_id: int = Depends(get_
                                                  thinking=request.thinking, model_name=request.model):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            # 流式同样走翻译层：不把 SDK 原始报错直接推给前端
+            yield f"data: {json.dumps({'type': 'error', 'content': _translate_agent_error(e).detail}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),

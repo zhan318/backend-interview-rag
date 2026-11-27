@@ -23,6 +23,13 @@ LLM_THINKING = os.getenv("LLM_THINKING", "false").strip().lower() == "true"
 # 开启思考时自动放大的输出上限：思考过程与正文共享 max_tokens，不放大极易返回空内容
 LLM_THINKING_MAX_TOKENS = int(os.getenv("LLM_THINKING_MAX_TOKENS", "2048"))
 
+# ========== LLM 请求超时与重试（生产必需，不要依赖 SDK 默认值）==========
+# openai SDK 默认 read timeout=600s、max_retries=2：单 key 触发 429 时，
+# 一个请求最坏可拖十几分钟，无限重试会占满线程池 → 并发雪崩（2026-11-12 压测复现）。
+# 这里显式收紧：60s × (1+1) 次，可经 .env 覆盖。
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
+
 # ========== 各厂商可用型号目录 ==========
 # /models 接口下发给前端渲染「型号」下拉；每项: (型号ID, 说明)
 # 默认型号 = 各厂商 GLM_MODEL / DEEPSEEK_MODEL / QWEN_MODEL（.env 可覆盖），不必是目录第一个

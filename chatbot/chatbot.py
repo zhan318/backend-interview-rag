@@ -13,9 +13,11 @@ from config import (
     GLM_API_KEY,
     GLM_BASE_URL,
     GLM_MODEL,
+    LLM_MAX_RETRIES,
     LLM_PROVIDER,
     LLM_THINKING,
     LLM_THINKING_MAX_TOKENS,
+    LLM_TIMEOUT,
     QWEN_API_KEY,
     QWEN_BASE_URL,
     QWEN_MODEL,
@@ -160,8 +162,18 @@ class DeepSeekAdapter(BaseLLM):
     """DeepSeek 官方 API（同步 + 异步双客户端）"""
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
-        self.client = OpenAI(api_key=api_key or DEEPSEEK_API_KEY, base_url=base_url or DEEPSEEK_BASE_URL)
-        self.aclient = AsyncOpenAI(api_key=api_key or DEEPSEEK_API_KEY, base_url=base_url or DEEPSEEK_BASE_URL)
+        # 显式收紧超时与重试：SDK 默认 600s + 重试 2 次，429 时会把线程池拖死
+        _client_kw = {"timeout": LLM_TIMEOUT, "max_retries": LLM_MAX_RETRIES}
+        self.client = OpenAI(
+            api_key=api_key or DEEPSEEK_API_KEY,
+            base_url=base_url or DEEPSEEK_BASE_URL,
+            **_client_kw,
+        )
+        self.aclient = AsyncOpenAI(
+            api_key=api_key or DEEPSEEK_API_KEY,
+            base_url=base_url or DEEPSEEK_BASE_URL,
+            **_client_kw,
+        )
         self.model = model or DEEPSEEK_MODEL
 
     @property
@@ -201,8 +213,10 @@ class OpenAICompatibleAdapter(BaseLLM):
     """通用 OpenAI 兼容适配器（同步 + 异步双客户端）"""
 
     def __init__(self, model_name: str, api_key: str, base_url: str, label: str = ""):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.aclient = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # 与 DeepSeekAdapter 一致：不继承 SDK 的 600s/2 次默认值
+        _client_kw = {"timeout": LLM_TIMEOUT, "max_retries": LLM_MAX_RETRIES}
+        self.client = OpenAI(api_key=api_key, base_url=base_url, **_client_kw)
+        self.aclient = AsyncOpenAI(api_key=api_key, base_url=base_url, **_client_kw)
         self.model = model_name
         self._label = label or model_name
 
