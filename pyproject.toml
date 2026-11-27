@@ -42,4 +42,32 @@ exclude = ["frontend/", ".venv/", "__pycache__/"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-q"
+# 默认带覆盖率：本地跑一次就能看到"哪一行没被测到"。
+# 门槛（--cov-fail-under）只放在 CI 里 —— 本地单跑某个文件时覆盖率天然很低，
+# 不适合作为失败条件。
+addopts = "-q --cov --cov-report=term-missing:skip-covered"
+
+# ── 覆盖率口径 ──
+# 只统计产品代码：测试自身、评测/压测脚本、前端产物不计入分母，
+# 否则覆盖率会被人为拉高（或拉低），失去作为质量门禁的意义。
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "eval/*",
+    "performance-test/*",
+    "frontend/*",
+    "node_modules/*",
+    ".venv/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+skip_covered = true          # 只打印未全覆盖的文件，输出更聚焦
+show_missing = true          # 标出未覆盖行号，方便补用例
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]

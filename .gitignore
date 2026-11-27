@@ -55,3 +55,9 @@ eval/reports/uvicorn-smoke.log
 # 压测 html 原始报告（locust 生成，体积大；核心结论在 markdown 报告里）
 performance-test/reports/*.html
 knowledge/chroma_db.bak-*/
+
+# 测试覆盖率产物（CI 会上传 artifact，本地不提交）
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
