@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import OBSIDIAN_VAULT_DIR  # noqa: E402
+from knowledge.config import config as kconfig  # noqa: E402
 from knowledge.pipeline import retrieve_obsidian  # noqa: E402
 
 
@@ -77,16 +78,17 @@ def main():
     bm25_hit = sum(r["bm25_hit"] for r in valid)
     merged_hit = sum(r["merged_hit"] for r in valid)
     topk_hit = sum(r["topk_hit"] for r in valid)
-    # BM25 额外救回：dense 漏检、融合后命中（说明稀疏检索补上了召回）
+    # BM25 额外救回：dense 漏检、最终命中（说明稀疏检索补上了召回）
     bm25_extra = sum(1 for r in valid if r["merged_hit"] and not r["dense_hit"])
     nin_found = sum(1 for r in nin if r["n_merged"] > 0)   # 越界检出 = 有返回即可能诱发幻觉
 
     print(f"\n===== 汇总（有效样本 {nv} 条，不含 not_in_kb {len(nin)} 条）=====")
     print(f"dense 语义检索命中率:  {dense_hit}/{nv} = {dense_hit/nv:.1%}")
     print(f"BM25 稀疏检索命中率:   {bm25_hit}/{nv} = {bm25_hit/nv:.1%}")
-    print(f"RRF 融合后命中率(总):  {merged_hit}/{nv} = {merged_hit/nv:.1%}")
+    stage = "融合 + 精排" if kconfig.RERANK_ENABLED else "仅融合（无精排）"
+    print(f"最终命中率（{stage}）: {merged_hit}/{nv} = {merged_hit/nv:.1%}")
     print(f"Recall@{args.k}(前{args.k}条命中): {topk_hit}/{nv} = {topk_hit/nv:.1%}")
-    print(f"BM25 额外救回:         {bm25_extra} 条（dense 漏检、融合命中）")
+    print(f"BM25 额外救回:         {bm25_extra} 条（dense 漏检、最终命中）")
     print(f"not_in_kb 越界检出:    {nin_found}/{len(nin)} 条（应全部为 0）")
 
     print("\n===== 按类别 =====")
@@ -98,7 +100,7 @@ def main():
     for c, (h, t) in sorted(by_cat.items()):
         print(f"  {c:<12} {h}/{t} = {h/t:.1%}")
 
-    print("\n===== 失败案例（有期望文档但融合后未命中）=====")
+    print("\n===== 失败案例（有期望文档但最终未命中）=====")
     fails = [r for r in valid if not r["merged_hit"]]
     if not fails:
         print("  无 —— 全部命中 ✅")
@@ -113,25 +115,35 @@ def main():
 
     # ── 写报告 ──
     report = Path(__file__).resolve().parent / "reports" / "retrieval-report.md"
+    stage = "融合 + 精排" if kconfig.RERANK_ENABLED else "仅融合（无精排）"
+    rerank_note = (
+        f"是 → Cross-Encoder 精排（top_n={args.k}，阈值 {kconfig.RERANK_THRESHOLD}）"
+        if kconfig.RERANK_ENABLED
+        else "否（KNOWLEDGE_RERANK_ENABLED=false，直接截断取前 k）"
+    )
     lines = [
         "# RAG 检索层评测报告",
         "",
         f"> 生成时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"> 评测集：eval/golden_set.jsonl（有效 {nv} 条 + not_in_kb {len(nin)} 条）| top-k = {args.k}",
-        f"> 检索路径：dense 语义检索（Chroma, top-{args.k}）+ BM25 稀疏检索 → RRF 融合",
+        f"> 检索路径：dense + BM25 各召回 {kconfig.RETRIEVE_RECALL_N} 条 → RRF 融合 → 精排 → top-{args.k}",
+        f"> 精排开关：{rerank_note}",
+        "> **口径说明**：dense / BM25 两行是「宽召回池内命中」"
+        f"（各 {kconfig.RETRIEVE_RECALL_N} 条），不是 top-{args.k} 命中，"
+        "不可与 top-k 指标直接比较。",
         "",
         "## 总指标（有效样本）",
         "",
         "| 指标 | 数值 |",
         "|---|---|",
-        f"| dense 语义检索单独命中率 | {dense_hit}/{nv} = {dense_hit/nv:.1%} |",
-        f"| BM25 稀疏检索单独命中率 | {bm25_hit}/{nv} = {bm25_hit/nv:.1%} |",
-        f"| **RRF 融合后命中率** | **{merged_hit}/{nv} = {merged_hit/nv:.1%}** |",
+        f"| dense 语义检索（宽召回 {kconfig.RETRIEVE_RECALL_N} 条内命中） | {dense_hit}/{nv} = {dense_hit/nv:.1%} |",
+        f"| BM25 稀疏检索（宽召回 {kconfig.RETRIEVE_RECALL_N} 条内命中） | {bm25_hit}/{nv} = {bm25_hit/nv:.1%} |",
+        f"| **最终命中率（{stage}）** | **{merged_hit}/{nv} = {merged_hit/nv:.1%}** |",
         f"| Recall@{args.k}（前 {args.k} 条内命中） | {topk_hit}/{nv} = {topk_hit/nv:.1%} |",
-        f"| BM25 额外救回 | {bm25_extra} 条（dense 漏检、融合命中） |",
+        f"| BM25 额外救回 | {bm25_extra} 条（dense 漏检、最终命中） |",
         f"| not_in_kb 越界检出 | {nin_found}/{len(nin)} 条（应全部为 0） |",
         "",
-        "## 按类别（融合后命中率）",
+        "## 按类别",
         "",
         "| 类别 | 命中/总数 | 命中率 |",
         "|---|---|---|",
