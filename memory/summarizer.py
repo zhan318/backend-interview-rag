@@ -84,7 +84,12 @@ def _build_summary(session_id: str, memory, provider: str,
 
     try:
         resp = chat(
-            [{"role": "system", "content": "\n".join(prompt_parts)}],
+            [
+                {"role": "system", "content": "\n".join(prompt_parts)},
+                # 必须带一条 user：GLM 等厂商要求 messages 至少含一条 user，
+                # 只发 system 会被拒（400 messages 参数非法）→ 压缩静默失效
+                {"role": "user", "content": "请按上述要求输出摘要。"},
+            ],
             provider=provider,
             user_key=user_key,
         )

@@ -99,3 +99,33 @@ def test_compress_merges_old_summary(memory, monkeypatch):
     monkeypatch.setattr("chatbot.chatbot.chat", fake_chat)
     summarizer.compress_if_needed("s1", memory)
     assert "旧摘要" in captured["prompt"]
+
+
+def test_compress_sends_valid_message_structure(memory, monkeypatch):
+    """回归：messages 结构必须合法，否则压缩会 100% 静默失效。
+
+    背景：原先只发一条 system 消息，GLM 直接返回 400「messages 参数非法」，
+    而外层 try/except 只打 warning 就返回 False —— 表现为「压缩从未生效」，
+    但因降级静默，测试只 mock 掉 chat 就完全看不出来。
+    这里不校验文案，只校验契约：至少一条 user + 每条 content 非空。
+    """
+    for i in range(14):
+        role = "user" if i % 2 == 0 else "assistant"
+        memory.save_message("s1", role, f"内容{i}")
+
+    captured = {}
+
+    def fake_chat(messages, **kwargs):
+        captured["messages"] = messages
+        return _fake_chat_response("摘要")
+
+    monkeypatch.setattr("chatbot.chatbot.chat", fake_chat)
+    assert summarizer.compress_if_needed("s1", memory) is True
+
+    messages = captured["messages"]
+    assert isinstance(messages, list) and messages, "messages 不能为空"
+    roles = [m["role"] for m in messages]
+    assert "user" in roles, f"必须包含 user 角色，实际为 {roles}"
+    assert roles[0] == "system", f"首条应为 system，实际为 {roles[0]}"
+    # 厂商同样会拒绝空 content 的消息
+    assert all(isinstance(m.get("content"), str) and m["content"].strip() for m in messages)
