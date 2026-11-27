@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+import threading
 
 from utils.logger import get_logger
 
@@ -115,23 +116,29 @@ class BM25Retriever:
         self._store = store
         self._docs: list | None = None
         self._bm25 = None
+        # 语料是懒加载的：并发首查时如果不加锁，N 个线程会各建一遍 BM25 语料
+        # （1345 条 chunk 的分词 + 索引），既浪费 CPU 又拖长首请求延迟。
+        self._load_lock = threading.Lock()
 
     def _ensure_loaded(self):
         if self._bm25 is not None:
             return
-        from langchain_core.documents import Document
+        with self._load_lock:
+            if self._bm25 is not None:  # 双检：只让第一个线程真正构建
+                return
+            from langchain_core.documents import Document
 
-        data = self._store.get(include=["documents", "metadatas"])
-        texts = data.get("documents") or []
-        metas = data.get("metadatas") or []
-        self._docs = [
-            Document(page_content=t, metadata=m or {})
-            for t, m in zip(texts, metas, strict=True)
-        ]
-        if self._docs:
-            from rank_bm25 import BM25Okapi
-            self._bm25 = BM25Okapi([tokenize_chinese(d.page_content) for d in self._docs])
-            logger.info("BM25 语料构建完成: %d 条 chunk", len(self._docs))
+            data = self._store.get(include=["documents", "metadatas"])
+            texts = data.get("documents") or []
+            metas = data.get("metadatas") or []
+            self._docs = [
+                Document(page_content=t, metadata=m or {})
+                for t, m in zip(texts, metas, strict=True)
+            ]
+            if self._docs:
+                from rank_bm25 import BM25Okapi
+                self._bm25 = BM25Okapi([tokenize_chinese(d.page_content) for d in self._docs])
+                logger.info("BM25 语料构建完成: %d 条 chunk", len(self._docs))
 
     def invalidate(self):
         self._docs = None
@@ -151,14 +158,20 @@ class BM25Retriever:
 
 
 _bm25_cache: dict[str, BM25Retriever] = {}
+# 缓存创建也要加锁：检索已改为并发读，两个线程同时首查会各建一个实例（一个被丢弃）
+_bm25_cache_lock = threading.Lock()
 
 
 def get_bm25_retriever(store) -> BM25Retriever:
     """按 collection 名获取（或创建）BM25 检索器。"""
     key = store.collection_name
-    if key not in _bm25_cache:
-        _bm25_cache[key] = BM25Retriever(store)
-    return _bm25_cache[key]
+    cached = _bm25_cache.get(key)
+    if cached is not None:
+        return cached
+    with _bm25_cache_lock:
+        if key not in _bm25_cache:
+            _bm25_cache[key] = BM25Retriever(store)
+        return _bm25_cache[key]
 
 
 def invalidate_bm25(collection_name: str | None = None):

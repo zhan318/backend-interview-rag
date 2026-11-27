@@ -6,7 +6,6 @@ query()            检索 → Prompt → DeepSeek → 答案
 
 import hashlib
 import re
-import threading
 from pathlib import Path
 
 from langchain_core.output_parsers import StrOutputParser
@@ -16,6 +15,7 @@ from langchain_openai import ChatOpenAI
 
 from config import OBSIDIAN_COLLECTION, OBSIDIAN_EXCLUDE, OBSIDIAN_VAULT_DIR
 from utils.logger import get_logger
+from utils.rwlock import ReadWriteLock
 
 from .chunker import Chunker
 from .config import config
@@ -26,13 +26,16 @@ from .vector_store import get_vector_store
 
 logger = get_logger(__name__)
 
-# Obsidian collection 的读/写互斥锁。
+# Obsidian collection 的读写锁（读并发、写独占、写优先）。
 # 文件监视器会在后台线程触发重索引，而增量更新是「先删旧 chunk、再写新 chunk」，
 # 窗口期内该笔记整篇不在索引里；若此时主请求正在检索，会读到不完整状态（表现为偶发漏答）。
-#   · 写侧：index_obsidian() 全程持锁
-#   · 读侧：retrieve_obsidian() 的检索段、query_obsidian() 的空库判断持锁
+#   · 写侧：index_obsidian() 全程持写锁（独占，重建期间不允许任何检索进来）
+#   · 读侧：retrieve_obsidian() 的检索段、query_obsidian() 的空库判断持读锁（彼此可并发）
 #   · 纯内存计算（RRF 融合、Prompt 拼接、LLM 生成）一律留在锁外，避免拉长持锁时间
-_obsidian_index_lock = threading.Lock()
+#
+# 用读写锁而不是普通互斥锁的原因：检索是读多写极少的场景。用一把普通锁时，
+# N 个并发检索会被排成队列，延迟随并发数线性放大（实测 30 并发 p50 1.9s）。
+_obsidian_rwlock = ReadWriteLock()
 
 
 # ═══════════════════════════════════════════
@@ -192,8 +195,8 @@ async def query_async(question: str) -> str:
 # ═══════════════════════════════════════════
 
 def index_obsidian(force: bool = False) -> dict:
-    """公共入口：加锁后调用实际索引逻辑，避免与查询并发读写 Chroma 冲突。"""
-    with _obsidian_index_lock:
+    """公共入口：持写锁后调用实际索引逻辑，独占读写避免与查询并发冲突。"""
+    with _obsidian_rwlock.write():
         return _index_obsidian_impl(force)
 
 
@@ -499,8 +502,9 @@ def retrieve_obsidian(question: str, k: int | None = None):
     top_k = k or config.RETRIEVE_TOP_K
     recall_n = max(config.RETRIEVE_RECALL_N, top_k)
 
-    # 与 index_obsidian 互斥：避免在「删旧 chunk → 写新 chunk」的窗口期读到不完整索引
-    with _obsidian_index_lock:
+    # 与 index_obsidian 互斥：避免在「删旧 chunk → 写新 chunk」的窗口期读到不完整索引。
+    # 持读锁（非互斥锁）：多个检索请求可以同时进来，只有重建索引时才独占。
+    with _obsidian_rwlock.read():
         dense_docs = store.search(question, k=recall_n)
         bm25_docs = get_bm25_retriever(store).search(question, k=recall_n)
 
@@ -511,8 +515,9 @@ def retrieve_obsidian(question: str, k: int | None = None):
     # threshold 用于判定「知识库无相关内容」：低于阈值的候选被丢弃，
     # merged 为空时上层会返回「未找到相关内容」，而不是硬塞 3 条不相关资料给 LLM。
     if config.RERANK_ENABLED:
-        from .reranker import rerank
-        merged = rerank(
+        from .reranker import rerank_guarded
+        # 走带过载保护的入口：并发超限/超时直接降级为 RRF 顺序，避免 CPU 打满后整体卡死
+        merged = rerank_guarded(
             question, candidates, top_n=top_k, threshold=config.RERANK_THRESHOLD
         )
     else:
@@ -532,7 +537,7 @@ def query_obsidian(question: str, k: int | None = None) -> str:
 
     store = get_vector_store(OBSIDIAN_COLLECTION)
     # 空库判断也需互斥：force 全量重建会删除并重建 collection，期间 count() 可能异常
-    with _obsidian_index_lock:
+    with _obsidian_rwlock.read():
         is_empty = store.count() == 0
     if is_empty:
         return "Obsidian 知识库尚未索引，请先调用 POST /obsidian/index 进行索引。"
