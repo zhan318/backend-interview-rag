@@ -29,7 +29,31 @@ services:
       - ${OBSIDIAN_VAULT_DIR:-/tmp/empty_vault}:/vault:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # 必须用 /health/live：/health 默认虽已轻量化，但存活探针只该验证进程可响应，
+      # 不依赖任何外部组件（原实现 /health 会加载 BGE 模型 28s，配 5s timeout 必挂）
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
+      # 首次启动要做 Obsidian 增量索引，给足冷启动时间再开始判活
+      start_period: 60s
+
+  # 可选：本地验证指标用。默认不启动，按需 `docker compose --profile monitoring up`
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: growth-companion-prometheus
+    profiles: ["monitoring"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:

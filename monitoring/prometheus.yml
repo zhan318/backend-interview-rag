@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s      # 演示用高频抓取；生产一般 15~30s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: growth-companion
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8000"]
+        labels:
+          env: local
