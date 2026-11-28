@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
@@ -40,6 +40,12 @@ from knowledge.pipeline import index_documents, index_obsidian
 from knowledge.pipeline import query as rag_query
 from memory.memory import Memory
 from utils.logger import get_logger
+from utils.metrics import (
+    HTTP_IN_PROGRESS,
+    observe_http,
+    render_metrics,
+)
+from utils.observability import normalize_request_id, request_id_var
 
 logger = get_logger(__name__)
 
@@ -154,39 +160,9 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════════
-#  请求日志中间件
-# ═══════════════════════════════════════════
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.time()
-    response = await call_next(request)
-    duration_ms = (time.time() - start) * 1000
-    logger.info(
-        "%s %s → %d (%.0fms)",
-        request.method, request.url.path, response.status_code, duration_ms,
-    )
-    return response
-
-
-# ═══════════════════════════════════════════
-#  全局异常处理
-# ═══════════════════════════════════════════
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.warning("HTTP异常 %d: %s %s", exc.status_code, request.method, request.url.path)
-    return error_response(exc.status_code, "HTTP_ERROR", exc.detail)
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("未处理异常 %s %s: %s", request.method, request.url.path, exc)
-    return error_response(500, "INTERNAL_ERROR", "服务器内部错误", str(exc))
-
-
-# ═══════════════════════════════════════════
 #  Rate Limiting（内存实现，无需额外依赖）
+#  注册顺序：本中间件必须在 observability 之前定义 —— FastAPI 后注册者在外层，
+#  这样 observability 才能看到被限流直接拒绝的 429。
 # ═══════════════════════════════════════════
 
 _rate_limit_store: dict[str, list] = defaultdict(list)
@@ -215,6 +191,86 @@ async def rate_limit_middleware(request: Request, call_next):
 
     _rate_limit_store[key].append(now)
     return await call_next(request)
+
+
+# ═══════════════════════════════════════════
+#  请求日志 + RED 指标中间件（最外层）
+# ═══════════════════════════════════════════
+
+_METRICS_PATH = "/metrics"
+# 超过该耗时打 WARN，便于从日志里直接捞出慢请求（毫秒）
+_SLOW_REQUEST_MS = float(os.getenv("SLOW_REQUEST_MS", "1000"))
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    """为每个请求绑定 request_id，并记录 RED 指标（Rate / Errors / Duration）。
+
+    request_id 来源：优先复用上游网关传入的 X-Request-ID（便于跨服务串联），
+    格式非法则丢弃重生成（防日志注入），最后通过响应头回传给客户端，
+    用户报障时贴一个 ID 就能定位全部日志。
+    """
+    # 指标抓取本身不计入指标，否则 /metrics 的调用会污染 RED 统计
+    if request.url.path == _METRICS_PATH:
+        return await call_next(request)
+
+    rid = normalize_request_id(request.headers.get("X-Request-ID"))
+    request.state.request_id = rid  # 异常处理器在 ContextVar 重置后仍能读到
+    token = request_id_var.set(rid)
+    method = request.method
+    HTTP_IN_PROGRESS.labels(method=method).inc()
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        duration_s = time.perf_counter() - started
+        # 路由匹配在 call_next 内部完成，所以 path 标签必须在这之后取模板
+        path = observe_http(request, status_code, duration_s)
+        HTTP_IN_PROGRESS.labels(method=method).dec()
+        duration_ms = duration_s * 1000
+
+        if status_code >= 500:
+            logger.error("%s %s → %d (%.0fms)", method, path, status_code, duration_ms)
+        elif status_code >= 400 or duration_ms >= _SLOW_REQUEST_MS:
+            logger.warning("%s %s → %d (%.0fms)", method, path, status_code, duration_ms)
+        else:
+            logger.info("%s %s → %d (%.0fms)", method, path, status_code, duration_ms)
+
+        request_id_var.reset(token)
+
+
+# ═══════════════════════════════════════════
+#  全局异常处理
+# ═══════════════════════════════════════════
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning("HTTP异常 %d: %s %s", exc.status_code, request.method, request.url.path)
+    return error_response(exc.status_code, "HTTP_ERROR", exc.detail)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """未捕获异常统一兜底。
+
+    安全要点：**不把 str(exc) 返回给客户端**。异常信息常含文件路径、SQL 片段、
+    上游 API 的原始报错（甚至密钥），只进服务端日志；客户端拿到 request_id，
+    运维用它在日志里定位同一次请求。
+    """
+    logger.error(
+        "未处理异常 %s %s: %s", request.method, request.url.path, exc, exc_info=True
+    )
+    return error_response(
+        500,
+        "INTERNAL_ERROR",
+        "服务器内部错误",
+        f"请稍后重试；排查请提供服务端日志中的 request_id={getattr(request.state, 'request_id', '-')}",
+    )
+
 
 # ═══════════════════════════════════════════
 #  Agent 实例池（LRU 上限管理，防止无上限增长导致内存膨胀）
@@ -869,9 +925,61 @@ async def root():
     return base
 
 
+# ═══════════════════════════════════════════
+#  可观测性端点
+# ═══════════════════════════════════════════
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    """Prometheus 抓取端点（text/plain; version=0.0.4）。
+
+    只暴露进程/HTTP/LLM/检索指标，**不含任何用户数据**（无 session_id、
+    无提问内容），因此可公网抓取；生产部署仍建议在网关层限制来源 IP。
+    """
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/health/live")
+async def liveness_check():
+    """存活探针：只证明「进程还能响应」，不碰数据库/向量库/模型，毫秒级返回。
+
+    给 Docker healthcheck、K8s livenessProbe 用。
+    为什么必须单独拆：原 /health 走 get_vector_store()，会加载 BGE 模型（实测 28s），
+    而 compose 里 timeout 只有 5s —— 容器永远被判定 unhealthy 并反复重启。
+    """
+    return {"status": "alive"}
+
+
+def _check_chroma_light() -> bool | str:
+    """轻量检查 Chroma 持久化文件是否可读（不实例化 client、不加载 embedding 模型）。"""
+    import sqlite3
+
+    from knowledge.config import config as kb_config
+
+    db_file = Path(kb_config.VECTOR_DB_DIR) / "chroma.sqlite3"
+    if not db_file.exists():
+        return f"{db_file} 不存在"
+    try:
+        conn = sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True, timeout=2)
+        try:
+            conn.execute("SELECT count(*) FROM collections").fetchone()
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        return str(e)
+
+
 @app.get("/health")
-async def health_check():
-    """标准健康检查（K8s/Docker 探活）。检查数据库和 Chroma 是否可用。"""
+async def health_check(deep: bool = False):
+    """就绪探针：检查数据库与向量库是否可用。
+
+    两档，避免「健康检查把服务拖慢」：
+    - 默认（deep=false）：数据库 SELECT 1 + Chroma 文件可读，毫秒级，给编排系统用；
+    - `?deep=true`：真正打开 collection 计数，会加载 embedding 模型（约 28s），
+      仅人工排障时用。
+    """
     checks = {"database": False, "chroma": False}
     try:
         conn = memory._connect()
@@ -880,13 +988,17 @@ async def health_check():
         checks["database"] = True
     except Exception as e:
         checks["database"] = str(e)
-    try:
-        from knowledge.vector_store import get_vector_store
-        store = get_vector_store("obsidian")
-        store.count()
-        checks["chroma"] = True
-    except Exception as e:
-        checks["chroma"] = str(e)
+
+    if deep:
+        try:
+            from knowledge.vector_store import get_vector_store
+            store = get_vector_store("obsidian")
+            store.count()
+            checks["chroma"] = True
+        except Exception as e:
+            checks["chroma"] = str(e)
+    else:
+        checks["chroma"] = _check_chroma_light()
 
     all_ok = checks["database"] is True and checks["chroma"] is True
     return {
