@@ -192,6 +192,28 @@ async def query_async(question: str) -> str:
     return await asyncio.to_thread(query, question)
 
 
+def retrieve_knowledge_passages(question: str, k: int | None = None):
+    """知识库（上传文档）检索，返回结构化片段，**不调用 LLM**。
+
+    与 query() 的分工：
+      · query()  → 检索 + 生成答案，供 /knowledge/query 这个固定 RAG 旁路使用；
+      · 本函数   → 只返回「编号 + 来源 + 原文」，供 Agent 工具使用，
+                   生成由主链路统一做一次（避免 Agent 拿到二手答案再复述）。
+    """
+    from .passages import to_passages
+
+    store = get_vector_store()
+    top_k = k or config.RETRIEVE_TOP_K
+
+    if store.count() == 0:
+        logger.info("知识库为空，自动索引")
+        if index_documents() == 0:
+            return []
+
+    docs = store.search(question, k=top_k)
+    return to_passages(docs)
+
+
 # ═══════════════════════════════════════════
 #  Obsidian 知识库：独立 collection，与 knowledge/docs 隔离
 # ═══════════════════════════════════════════
@@ -537,6 +559,25 @@ def retrieve_obsidian(question: str, k: int | None = None):
     # 空结果占比是「知识库覆盖度」的直接信号：持续偏高说明语料缺口或阈值过严
     RAG_QUERIES_TOTAL.labels(result="hit" if merged else "empty").inc()
     return dense_docs, bm25_docs, merged
+
+
+def retrieve_obsidian_passages(question: str, k: int | None = None):
+    """Obsidian 检索，返回结构化片段，**不调用 LLM**（Agent 工具的正式入口）。
+
+    复用 retrieve_obsidian() 的完整两阶段检索（dense + BM25 → RRF → 精排 + 阈值），
+    只把结果从 Document 转成 Passage，元数据由此保留到最终答案。
+    """
+    from .passages import to_passages
+
+    store = get_vector_store(OBSIDIAN_COLLECTION)
+    # 空库判断也需互斥：force 全量重建会删除并重建 collection，期间 count() 可能异常
+    with _obsidian_rwlock.read():
+        is_empty = store.count() == 0
+    if is_empty:
+        return []
+
+    dense_docs, bm25_docs, merged = retrieve_obsidian(question, k)
+    return to_passages(merged, dense_docs, bm25_docs)
 
 
 def query_obsidian(question: str, k: int | None = None) -> str:
