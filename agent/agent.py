@@ -1,11 +1,13 @@
 import asyncio
 import json
+import time
 
 from chatbot.chatbot import ThinkFilter, achat, achat_stream, chat, chat_stream, strip_think
 from memory.memory import Memory
 from memory.vector_memory import get_vector_memory
 from tools import registry
 from utils.logger import get_logger
+from utils.metrics import AGENT_TOOL_CALLS_TOTAL, AGENT_TOOL_DURATION
 
 logger = get_logger(__name__)
 
@@ -194,15 +196,22 @@ class Agent:
         tool_func = registry.tools.get(tool_name)
         if tool_func is None:
             logger.warning("未知工具: %s", tool_name)
+            # 工具名来自模型输出，直接进 label 会被任意字符串撑爆基数
+            AGENT_TOOL_CALLS_TOTAL.labels(tool="__unknown__", status="unknown").inc()
             return f"工具 {tool_name} 不存在"
 
+        started = time.perf_counter()
         try:
             result = tool_func(**tool_args)
+            AGENT_TOOL_CALLS_TOTAL.labels(tool=tool_name, status="ok").inc()
             logger.info("工具 %s 返回成功", tool_name)
             return str(result)
         except Exception as e:
+            AGENT_TOOL_CALLS_TOTAL.labels(tool=tool_name, status="error").inc()
             logger.error("工具 %s 执行失败: %s", tool_name, e)
             return f"工具执行失败: {str(e)}"
+        finally:
+            AGENT_TOOL_DURATION.labels(tool=tool_name).observe(time.perf_counter() - started)
 
     async def _aexecute_tool(self, tool_call) -> str:
         """异步执行工具（Agent.arun 使用）。
@@ -224,18 +233,24 @@ class Agent:
         sync_tool = registry.tools.get(tool_name)
         if async_tool is None and sync_tool is None:
             logger.warning("未知工具: %s", tool_name)
+            AGENT_TOOL_CALLS_TOTAL.labels(tool="__unknown__", status="unknown").inc()
             return f"工具 {tool_name} 不存在"
 
+        started = time.perf_counter()
         try:
             if async_tool is not None:
                 result = await async_tool(**tool_args)
             else:
                 result = await asyncio.to_thread(sync_tool, **tool_args)
+            AGENT_TOOL_CALLS_TOTAL.labels(tool=tool_name, status="ok").inc()
             logger.info("工具 %s 返回成功", tool_name)
             return str(result)
         except Exception as e:
+            AGENT_TOOL_CALLS_TOTAL.labels(tool=tool_name, status="error").inc()
             logger.error("工具 %s 执行失败: %s", tool_name, e)
             return f"工具执行失败: {str(e)}"
+        finally:
+            AGENT_TOOL_DURATION.labels(tool=tool_name).observe(time.perf_counter() - started)
 
     def _load_context(self, model_provider: str = "deepseek", user_key: dict | None = None,
                       mode: str = "workspace"):

@@ -18,6 +18,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import lru_cache
 
 from utils.logger import get_logger
+from utils.metrics import RERANK_DEGRADED_TOTAL
 
 from .config import config
 
@@ -52,6 +53,9 @@ def _record(kind: str, latency_s: float = 0.0) -> None:
         _stats["calls"] += 1
         _stats[kind] += 1
         _stats["total_latency_ms"] += latency_s * 1000
+    # 同步到 Prometheus：进程内 _stats 只在单实例可读，指标才能被外部聚合告警
+    if kind.startswith("degraded_"):
+        RERANK_DEGRADED_TOTAL.labels(reason=kind.removeprefix("degraded_")).inc()
 
 
 def get_rerank_stats() -> dict:

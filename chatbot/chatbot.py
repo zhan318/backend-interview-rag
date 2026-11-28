@@ -1,6 +1,7 @@
 """LLM 适配器：支持多模型动态切换（同步 + 异步双通道）"""
 
 import re
+import time
 from abc import ABC, abstractmethod
 
 from openai import AsyncOpenAI, OpenAI
@@ -23,6 +24,7 @@ from config import (
     QWEN_MODEL,
 )
 from utils.logger import get_logger
+from utils.metrics import LLM_CALL_DURATION, LLM_CALLS_TOTAL
 
 logger = get_logger(__name__)
 
@@ -382,29 +384,100 @@ def create_llm(provider: str = None, user_key: dict = None, thinking: bool = Non
     return llm.set_thinking(thinking, preset.get("thinking_param"))
 
 
+# ═══════════════════════════════════════════
+#  指标埋点（所有 LLM 调用都汇聚到本模块的 4 个对外函数）
+# ═══════════════════════════════════════════
+
+def _llm_labels(llm) -> tuple[str, str]:
+    """取 (provider, model) 两个低基数标签。
+
+    用 display_name 而不是 base_url：URL 含私有网关地址，进指标会泄露拓扑。
+    """
+    provider = getattr(llm, "display_name", None) or "unknown"
+    model = getattr(llm, "model", None) or "unknown"
+    return str(provider), str(model)
+
+
+def _record_llm(provider: str, model: str, duration_s: float, stream: bool, status: str) -> None:
+    LLM_CALLS_TOTAL.labels(provider=provider, model=model, status=status).inc()
+    LLM_CALL_DURATION.labels(provider=provider, stream="true" if stream else "false").observe(
+        duration_s
+    )
+
+
+def _timed_stream(stream, provider: str, model: str):
+    """包装同步流式响应：消费完（或异常）才记总耗时。
+
+    流式调用真正耗时发生在迭代过程中，构造请求时只完成了连接建立；
+    不包一层的话指标里只能看到几百毫秒，误导排障。
+    """
+    started = time.perf_counter()
+    status = "ok"
+    try:
+        yield from stream
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _record_llm(provider, model, time.perf_counter() - started, True, status)
+
+
+async def _atimed_stream(stream, provider: str, model: str):
+    """包装异步流式响应（同上）。"""
+    started = time.perf_counter()
+    status = "ok"
+    try:
+        async for chunk in stream:
+            yield chunk
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _record_llm(provider, model, time.perf_counter() - started, True, status)
+
+
 def chat(messages, tools=None, tool_choice="auto", provider: str = None, user_key: dict = None,
          thinking: bool = None, model_name: str = None):
     """对外接口（同步）：支持每次请求指定模型、用户级 key 与思考模式"""
     llm = create_llm(provider, user_key, thinking, model_name)
-    return llm.chat(messages, tools, tool_choice)
+    provider_label, model_label = _llm_labels(llm)
+    started = time.perf_counter()
+    try:
+        result = llm.chat(messages, tools, tool_choice)
+    except Exception:
+        _record_llm(provider_label, model_label, time.perf_counter() - started, False, "error")
+        raise
+    _record_llm(provider_label, model_label, time.perf_counter() - started, False, "ok")
+    return result
 
 
 def chat_stream(messages, tools=None, tool_choice="auto", provider: str = None, user_key: dict = None,
                 thinking: bool = None, model_name: str = None):
     """对外接口（同步流式）"""
     llm = create_llm(provider, user_key, thinking, model_name)
-    return llm.chat_stream(messages, tools, tool_choice)
+    provider_label, model_label = _llm_labels(llm)
+    return _timed_stream(llm.chat_stream(messages, tools, tool_choice), provider_label, model_label)
 
 
 async def achat(messages, tools=None, tool_choice="auto", provider: str = None, user_key: dict = None,
                 thinking: bool = None, model_name: str = None):
     """对外接口（异步）：Agent.arun 使用，不阻塞事件循环"""
     llm = create_llm(provider, user_key, thinking, model_name)
-    return await llm.achat(messages, tools, tool_choice)
+    provider_label, model_label = _llm_labels(llm)
+    started = time.perf_counter()
+    try:
+        result = await llm.achat(messages, tools, tool_choice)
+    except Exception:
+        _record_llm(provider_label, model_label, time.perf_counter() - started, False, "error")
+        raise
+    _record_llm(provider_label, model_label, time.perf_counter() - started, False, "ok")
+    return result
 
 
 async def achat_stream(messages, tools=None, tool_choice="auto", provider: str = None, user_key: dict = None,
                        thinking: bool = None, model_name: str = None):
     """对外接口（异步流式）"""
     llm = create_llm(provider, user_key, thinking, model_name)
-    return await llm.achat_stream(messages, tools, tool_choice)
+    provider_label, model_label = _llm_labels(llm)
+    stream = await llm.achat_stream(messages, tools, tool_choice)
+    return _atimed_stream(stream, provider_label, model_label)

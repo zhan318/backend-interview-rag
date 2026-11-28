@@ -6,6 +6,7 @@ query()            检索 → Prompt → DeepSeek → 答案
 
 import hashlib
 import re
+import time
 from pathlib import Path
 
 from langchain_core.output_parsers import StrOutputParser
@@ -15,6 +16,7 @@ from langchain_openai import ChatOpenAI
 
 from config import OBSIDIAN_COLLECTION, OBSIDIAN_EXCLUDE, OBSIDIAN_VAULT_DIR
 from utils.logger import get_logger
+from utils.metrics import RAG_QUERIES_TOTAL, RETRIEVAL_STAGE_DURATION
 from utils.rwlock import ReadWriteLock
 
 from .chunker import Chunker
@@ -505,11 +507,18 @@ def retrieve_obsidian(question: str, k: int | None = None):
     # 与 index_obsidian 互斥：避免在「删旧 chunk → 写新 chunk」的窗口期读到不完整索引。
     # 持读锁（非互斥锁）：多个检索请求可以同时进来，只有重建索引时才独占。
     with _obsidian_rwlock.read():
+        started = time.perf_counter()
         dense_docs = store.search(question, k=recall_n)
+        RETRIEVAL_STAGE_DURATION.labels(stage="dense").observe(time.perf_counter() - started)
+
+        started = time.perf_counter()
         bm25_docs = get_bm25_retriever(store).search(question, k=recall_n)
+        RETRIEVAL_STAGE_DURATION.labels(stage="bm25").observe(time.perf_counter() - started)
 
     # RRF 融合是纯内存计算，放在锁外执行，尽量缩短持锁时间
+    started = time.perf_counter()
     candidates = fuse_documents(dense_docs, bm25_docs, top_n=recall_n)
+    RETRIEVAL_STAGE_DURATION.labels(stage="fuse").observe(time.perf_counter() - started)
 
     # 精排：把候选交给 Cross-Encoder 重排（失败自动降级为原顺序）
     # threshold 用于判定「知识库无相关内容」：低于阈值的候选被丢弃，
@@ -517,12 +526,16 @@ def retrieve_obsidian(question: str, k: int | None = None):
     if config.RERANK_ENABLED:
         from .reranker import rerank_guarded
         # 走带过载保护的入口：并发超限/超时直接降级为 RRF 顺序，避免 CPU 打满后整体卡死
+        started = time.perf_counter()
         merged = rerank_guarded(
             question, candidates, top_n=top_k, threshold=config.RERANK_THRESHOLD
         )
+        RETRIEVAL_STAGE_DURATION.labels(stage="rerank").observe(time.perf_counter() - started)
     else:
         merged = candidates[:top_k]
 
+    # 空结果占比是「知识库覆盖度」的直接信号：持续偏高说明语料缺口或阈值过严
+    RAG_QUERIES_TOTAL.labels(result="hit" if merged else "empty").inc()
     return dense_docs, bm25_docs, merged
 
 
