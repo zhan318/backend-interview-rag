@@ -108,10 +108,14 @@
 │   └── __init__.py             # 认证封装 + GitHub OAuth2.0（基于 memory 层）
 │
 ├── utils/
-│   └── logger.py               # 日志模块（标准 logging + 彩色控制台）
+│   ├── logger.py               # 日志模块（标准 logging + 彩色/JSON 双格式 + 脱敏）
+│   ├── observability.py        # request_id 上下文 + LogRecord 注入 + 敏感信息脱敏
+│   ├── metrics.py              # Prometheus 指标注册表（RED / LLM / 检索 / 工具）+ 路径归一化
+│   └── rwlock.py               # 写优先读写锁（检索读并发 / 索引写独占）
 │
-├── tests/                      # 12 个测试文件 + conftest（约 78 个用例）
-├── eval/                       # RAG 评测：golden set + 检索层指标 + 生成层 LLM-as-a-Judge
+├── tests/                      # 17 个测试文件 + conftest（185 个用例，覆盖率 50%）
+├── eval/                       # RAG 评测 + 消融 + 上下文压缩 + 可观测性验证
+├── monitoring/                 # Prometheus 抓取配置 + 指标验证报告与 QPS 曲线
 ├── performance-test/           # locust 压测 + Lighthouse 前端测速 + 资源监控
 │
 └── frontend/                   # React 聊天界面
@@ -137,7 +141,7 @@
 浏览器（React SPA）
   │  SSE / JSON
   ▼
-FastAPI（限流中间件 → 鉴权依赖 → 路由）
+FastAPI（可观测性中间件：request_id + RED 指标 → 限流 → 鉴权依赖 → 路由）
   │
   ▼
 AgentPool（LRU，按 session_id 复用实例）
@@ -165,6 +169,7 @@ ReAct 循环（≤5 轮）：LLM 决策 → 执行工具 → 结果回填 messag
 | **过载保护** | 精排走独立线程池 + 非阻塞信号量，超限不排队、立即降级；LLM 客户端显式超时与重试上限 | CPU 密集任务排队会把延迟越堆越高，最终表现为「全部超时」 |
 | **索引读写锁** | `utils/rwlock.py` 自研写优先读写锁：检索持读锁（彼此并发），重建索引持写锁（独占） | 一把普通互斥锁会把所有并发检索排成队列；写优先避免重索引被持续查询饿死 |
 | **写入优化** | SQLite WAL + `busy_timeout` + 批量单事务落库 | 高并发下写锁竞争与写放大 |
+| **可观测性** | 三级探针（live / ready / deep）；`/metrics` 标准 Prometheus 指标；`X-Request-ID` 注入每行日志；日志出口脱敏 | 排查靠时间戳猜、健康检查触发模型加载拖垮容器、异常原文泄露内部信息 |
 
 ### RAG 优化一览（每层都有实测数据）
 
@@ -187,6 +192,24 @@ ReAct 循环（≤5 轮）：LLM 决策 → 执行工具 → 结果回填 messag
 `eval/reports/rerank-overload-report.md`（过载 A/B 与并发上限调参）、
 `eval/reports/index-lock-report.md`（互斥锁 vs 读写锁，含「p50 未改善」的负向结论）。
 
+### 可观测性（探针分层 + RED 指标 + 请求级追踪）
+
+| 能力 | 实现 | 验证方式 |
+|---|---|---|
+| 请求追踪 | 复用/生成 `X-Request-ID`（12 位 hex），ContextVar 绑定 + `LogRecordFactory` 自动注入每行日志，响应头回传 | 含换行/超长的伪造 ID 被丢弃重生成（防日志注入） |
+| 结构化日志 | `LOG_FORMAT=json` 输出单行 JSON（供 Loki/ELK 采集）；出口统一脱敏 | 单测覆盖 `sk-` / `Bearer` / `api_key=` / JWT / URL 凭证 5 类形态 |
+| 指标 | `/metrics` 标准 Prometheus 文本：HTTP RED、LLM 耗时（含流式总时长）、检索四阶段、精排降级原因、工具调用 | 8 并发 × 20s：客户端 6543 成功 = 服务端计数 6543，4xx 627 = 627，零误差 |
+| 健康检查 | `/health/live`（零依赖）/ `/health`（文件级，不加载模型）/ `/health?deep=true`（真开 collection） | live 2ms、ready 17ms、deep 85ms~28s（模型冷加载） |
+
+**这不是演练，是修真实缺陷**：原 `/health` 走 `get_vector_store()` 会加载 BGE 模型，实测 28s（本次冷启动 85s），而 `docker-compose.yml` 的 `timeout: 5s` → 容器永远 `healthy=false` 并反复重启。拆三级后编排探针 2ms 返回。
+
+**指标设计要点**（面试常追问）：
+- path 标签用**路由模板**（`/sessions/{session_id}`）而不是原始 URL —— 否则每个会话 id 生成一条时间序列，几千用户就撑爆 Prometheus 基数；404/扫描器路径统一归 `__unmatched__`
+- 流式 LLM 的耗时包在生成器外层，流消费完才记录（构造请求时只完成了连接建立，此时记录会得到几百毫秒的假数据）
+- `/metrics` 自身不计入指标，避免每次抓取污染 RED 统计
+
+复现：`python eval/eval_observability.py --base-url http://127.0.0.1:8000`，产物 `monitoring/observability-report.md` + `qps.svg`；装了 Docker 可 `docker compose --profile monitoring up` 起 Prometheus 同口径复核。
+
 ---
 
 ## 🛠️ 技术栈
@@ -201,7 +224,8 @@ ReAct 循环（≤5 轮）：LLM 决策 → 执行工具 → 结果回填 messag
 | 外部工具 | MCP（stdio）、wttr.in、DuckDuckGo、GitHub / 微博 / 百度热榜 |
 | 数据校验 | Pydantic v2 |
 | 前端 | React 19 + TypeScript + Vite 8 + Tailwind CSS 4 + markdown-it + DOMPurify |
-| 质量保障 | pytest（约 78 用例）+ ruff；locust 压测 + Lighthouse 前端测速 |
+| 质量保障 | pytest（**185 用例**，覆盖率 50%）+ ruff；locust 压测 + Lighthouse 前端测速 |
+| 可观测性 | Prometheus（`prometheus-client`）+ request_id 全链路日志 + 三级健康探针 |
 | 容器化 | Docker（两阶段构建） |
 
 ---
@@ -325,6 +349,8 @@ DEEPSEEK_API_KEY=sk-xxx
 
 # ── 运行时调优 ──
 # LOG_LEVEL=INFO               # 日志级别（DEBUG / INFO / WARNING / ERROR，非法值回退 INFO）
+# LOG_FORMAT=text              # text=人类可读（含 request_id）；json=单行 JSON，供 Loki/ELK 采集
+# SLOW_REQUEST_MS=1000         # 超过该耗时的请求日志升级为 WARNING
 # RATE_LIMIT_MAX=30            # 每 60s 每 IP 每路径最大请求数（登录/注册固定 5 次）
 # AGENT_POOL_MAX=200           # Agent 实例池 LRU 上限
 # MEMORY_DB_PATH=memory/chat_history.db
@@ -516,7 +542,7 @@ async def get_news_async(topic: str) -> str:
 | 层级 | 工具 | 规模 | 关键指标 | 入口 |
 |------|------|------|---------|------|
 | 静态检查 | ruff（E/W/F/I/B/UP/SIM） | 全项目 | 0 告警 | CI |
-| 单元测试 | pytest | 108 用例 / 16 文件 | 认证、记忆、RRF 融合、切片、工具执行、看板聚合、过载降级 | `tests/` |
+| 单元测试 | pytest | 139 用例 / 17 文件 | 认证、记忆、RRF 融合、切片、工具执行、看板聚合、过载降级、可观测性 | `tests/` |
 | 接口测试 | pytest + FastAPI TestClient | 46 用例 | 全部路由；认证 / 越权 / 限流 / 降级 / 429→503 | `tests/test_api.py` |
 | 端到端 | 进程内直调 Agent + 白盒 judge | 36 用例 | 工具路由准确率 **97.2%**（35/36），综合 90.3% | `eval/eval_e2e.py` |
 | HTTP 冒烟 | 真实 uvicorn + requests | 30 接口 | **30/30 通过** | `eval/eval_http_smoke*.py` |
@@ -524,8 +550,8 @@ async def get_news_async(topic: str) -> str:
 | 生成效果 | LLM-as-a-Judge（RAGAS 口径） | 21 条 | 见 `eval/reports/generation-report.md` | `eval/eval_generation.py` |
 | 性能 | locust 1–50 并发 + Lighthouse + 资源监控 | 多轮 | 定位 2 个真实瓶颈并修复（见下）；精排过载实验见 `eval/reports/rerank-overload-report.md` | `performance-test/` |
 
-**覆盖率 49.0%**（`pytest --cov` 口径，只统计产品代码，排除测试脚本 / 评测 / 压测 / 前端产物）。
-核心模块显著高于均值：`knowledge/chunker.py` 94%、`dashboard.py` 92%、`memory/memory.py` 83%、`api.py` 69%。
+**覆盖率 50%**（`pytest --cov` 口径，只统计产品代码，排除测试脚本 / 评测 / 压测 / 前端产物）。
+核心模块显著高于均值：`knowledge/chunker.py` 94%、`dashboard.py` 92%、`memory/memory.py` 83%、`api.py` 69%、`utils/metrics.py` 89%。
 天气 / 热搜 / 网页搜索 / Obsidian 监听这类外部 IO 模块不追求覆盖率——它们由 mock 隔离在单测之外，改由冒烟与压测覆盖真实链路。
 
 **CI 门禁**（`.github/workflows/ci.yml`）：push / PR 触发 `ruff check` + `pytest --cov-fail-under=45`，覆盖率 XML 作为 artifact 上传。
@@ -541,6 +567,7 @@ async def get_news_async(topic: str) -> str:
 | 限流 | 敏感接口 5 次/分钟后 429 | `test_sensitive_endpoint_rate_limited_after_five_calls` |
 | 安全 | 密钥列表只返回脱敏值 | `test_save_list_and_delete_key` |
 | 路径逃逸 | 含 `/`、`..` 的标题不得写出 vault | `test_save_sanitizes_illegal_filename_chars` |
+| 可观测性 | 探针不许加载模型、日志不许泄密、指标标签不许高基数 | `test_liveness_never_touches_vector_store`、`test_exception_detail_not_returned_to_client`、`test_unmatched_paths_are_collapsed` |
 
 ### 测试隔离（三层，缺一层就互相污染）
 
@@ -548,7 +575,7 @@ async def get_news_async(topic: str) -> str:
 2. **外部服务**：`OBSIDIAN_VAULT_DIR` 置空，避免触发 Obsidian 全量索引与 embedding 模型加载（真实加载一次约 28s）。
 3. **进程内状态**：限流器、Agent 池是模块级内存结构，每个用例前清空，否则注册接口「5 次/分钟」的限制会误伤后续用例。
 
-外部依赖统一用 `tests/fakes.py` 的替身（FakeAgent / FakeVectorStore / FakeLLMResponse）：全程不联网、不加载模型，154 个用例约 81s 跑完（`--no-cov` 时 35s）。
+外部依赖统一用 `tests/fakes.py` 的替身（FakeAgent / FakeVectorStore / FakeLLMResponse）：全程不联网、不加载模型，185 个用例约 96s 跑完（`--no-cov` 时约 45s）。
 
 ### 压测发现的真实缺陷（已修复，且有回归用例）
 
