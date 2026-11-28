@@ -45,6 +45,7 @@ eval/reports/answers.jsonl
 # e2e 评测运行产物（含问答内容与检索出的笔记片段，不进版本库）
 eval/reports/e2e-answers.jsonl
 eval/reports/e2e-run.log
+eval/reports/a1-architecture-raw.json
 # 冒烟/构建运行日志（不进版本库）
 eval/reports/docker-build.log
 eval/reports/uvicorn-smoke.log
@@ -52,6 +53,8 @@ eval/reports/uvicorn-smoke.log
 # 备份文件（临时产物，不进版本库）
 *-bak.md
 eval/reports/answers-*.jsonl
+# 评测专用临时库（脚本跑完会尝试删除；受限环境可能残留）
+eval/reports/.*.db*
 
 # 压测 html 原始报告（locust 生成，体积大；核心结论在 markdown 报告里）
 performance-test/reports/*.html
