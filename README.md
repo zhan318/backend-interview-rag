@@ -25,6 +25,7 @@
 - **增量索引**：确定性文档 ID + mtime 比对，只处理新增 / 变更 / 删除的文件
 - **实时监视**：watchdog 变更即触发（未安装自动回退 5s 轮询），短时多次保存防抖合并
 - **两阶段检索**：dense + BM25 混合召回 → RRF 融合 → Cross-Encoder 精排，兼顾召回与排序精度
+- **引用可追溯**：检索工具只返回「编号 + 来源 + 原文片段」，生成只在主链路做一次；单次问答的 LLM 调用量从 `2N+1` 降到 `N+1`，答案可标注 `[n]` 回溯原文
 - **上传文档 RAG**：PDF / TXT / MD → 切片 → 向量化 → 检索 → 生成答案
 - **笔记读写**：Agent 可检索、读取、创建 Obsidian 笔记（限制在 vault 内，受排除清单保护）
 
@@ -102,7 +103,8 @@
 │   ├── retriever.py            # 检索器 + 上下文格式化
 │   ├── hybrid.py               # 混合检索：BM25 + 中文分词 + RRF 融合
 │   ├── obsidian_watcher.py     # vault 文件监视（watchdog / 轮询回退）
-│   └── pipeline.py             # RAG 主流程：index_documents / query / index_obsidian
+│   ├── pipeline.py             # RAG 主流程：index_documents / query / index_obsidian
+│   └── passages.py             # 检索结果 → 结构化片段（编号 + 来源 + 原文，工具层直接返回）
 │
 ├── auth/
 │   └── __init__.py             # 认证封装 + GitHub OAuth2.0（基于 memory 层）
@@ -113,8 +115,8 @@
 │   ├── metrics.py              # Prometheus 指标注册表（RED / LLM / 检索 / 工具）+ 路径归一化
 │   └── rwlock.py               # 写优先读写锁（检索读并发 / 索引写独占）
 │
-├── tests/                      # 17 个测试文件 + conftest（185 个用例，覆盖率 50%）
-├── eval/                       # RAG 评测 + 消融 + 上下文压缩 + 可观测性验证
+├── tests/                      # 18 个测试文件 + conftest（209 个用例，覆盖率 52%）
+├── eval/                       # RAG 评测 + 消融 + 上下文压缩 + 可观测性 / 架构验证
 ├── monitoring/                 # Prometheus 抓取配置 + 指标验证报告与 QPS 曲线
 ├── performance-test/           # locust 压测 + Lighthouse 前端测速 + 资源监控
 │
@@ -162,6 +164,7 @@ ReAct 循环（≤5 轮）：LLM 决策 → 执行工具 → 结果回填 messag
 |------|------|-----------|
 | **四通道执行** | LLM 调用走 `AsyncOpenAI`；工具优先 async 版，无则 `asyncio.to_thread` 入线程池 | 同步调用阻塞事件循环，高并发下请求无法完成 |
 | **两阶段检索** | dense + BM25 各召回 20 条 → RRF（`k=60`）融合 → Cross-Encoder 精排取 top-3 | 单路召回漏检；且 RRF 只看排名、不看内容，术语密集的流水笔记会把真正相关的专题笔记挤出前 3 |
+| **检索与生成分离** | 检索工具只返回「编号 + 来源 + 原文片段」，生成只在 Agent 主链路做一次 | 工具内部再生成会让单次问答变成两次 LLM 调用；且 `source`/`score` 在第一次生成后即丢失，答案无法回溯原文 |
 | **增量索引** | `sha1(相对路径)` 作文档 ID，mtime 比对跳过未变文件，变更先删后写，消失则删 | 全量重索引开销大、频次受限 |
 | **上下文压缩** | 消息数超阈值触发滚动摘要，记录压缩边界，只保留最近若干条原文 | messages 无限膨胀导致 token 成本失控 |
 | **工具注册** | 装饰器从函数签名 + 类型注解推断 JSON Schema；async 版自动复用同名 schema | 手动维护 schema 与实现易脱节 |
@@ -224,7 +227,7 @@ ReAct 循环（≤5 轮）：LLM 决策 → 执行工具 → 结果回填 messag
 | 外部工具 | MCP（stdio）、wttr.in、DuckDuckGo、GitHub / 微博 / 百度热榜 |
 | 数据校验 | Pydantic v2 |
 | 前端 | React 19 + TypeScript + Vite 8 + Tailwind CSS 4 + markdown-it + DOMPurify |
-| 质量保障 | pytest（**185 用例**，覆盖率 50%）+ ruff；locust 压测 + Lighthouse 前端测速 |
+| 质量保障 | pytest（**209 用例**，覆盖率 52%）+ ruff；locust 压测 + Lighthouse 前端测速 |
 | 可观测性 | Prometheus（`prometheus-client`）+ request_id 全链路日志 + 三级健康探针 |
 | 容器化 | Docker（两阶段构建） |
 
@@ -471,8 +474,8 @@ curl -X POST "http://127.0.0.1:8000/chat" \
 | `get_weather` | `weather.py` | 查询天气（wttr.in，无需 Key） |
 | `get_hotlist` | `hotlist.py` | GitHub 趋势 / 微博热搜 / 百度热搜 |
 | `web_search` | `web_search.py` | 联网搜索最新资讯（DuckDuckGo，无需 Key） |
-| `knowledge_search` | `rag_tool.py` | 检索上传文档知识库 |
-| `search_obsidian_notes` | `obsidian.py` | 语义检索个人笔记库 |
+| `knowledge_search` | `rag_tool.py` | 检索上传文档知识库（返回带编号的原文片段，非答案） |
+| `search_obsidian_notes` | `obsidian.py` | 语义检索个人笔记库（返回带编号的原文片段，非答案） |
 | `read_obsidian_note` | `obsidian.py` | 读取指定笔记原文 |
 | `mock_interview` | `mock_interview.py` | 模拟面试出题 |
 | `mcp_{server}_{tool}` | `mcp_client.py` | 外部 MCP 工具（连接后动态注册） |
@@ -542,15 +545,16 @@ async def get_news_async(topic: str) -> str:
 | 层级 | 工具 | 规模 | 关键指标 | 入口 |
 |------|------|------|---------|------|
 | 静态检查 | ruff（E/W/F/I/B/UP/SIM） | 全项目 | 0 告警 | CI |
-| 单元测试 | pytest | 139 用例 / 17 文件 | 认证、记忆、RRF 融合、切片、工具执行、看板聚合、过载降级、可观测性 | `tests/` |
+| 单元测试 | pytest | 163 用例 / 18 文件 | 认证、记忆、RRF 融合、切片、工具执行、看板聚合、过载降级、可观测性、检索片段 | `tests/` |
 | 接口测试 | pytest + FastAPI TestClient | 46 用例 | 全部路由；认证 / 越权 / 限流 / 降级 / 429→503 | `tests/test_api.py` |
 | 端到端 | 进程内直调 Agent + 白盒 judge | 36 用例 | 工具路由准确率 **97.2%**（35/36），综合 90.3% | `eval/eval_e2e.py` |
 | HTTP 冒烟 | 真实 uvicorn + requests | 30 接口 | **30/30 通过** | `eval/eval_http_smoke*.py` |
 | 检索效果 | golden set + Recall@K | 21 条有效 | 精排后 **71.4%**；逐层消融（dense / BM25 / RRF / 精排各贡献多少）见 `eval/reports/ablation-report.md` | `eval/eval_retrieval.py` |
 | 生成效果 | LLM-as-a-Judge（RAGAS 口径） | 21 条 | 见 `eval/reports/generation-report.md` | `eval/eval_generation.py` |
+| 架构验证 | 进程内直调 Agent + LLM 调用计数 | 5 道 RAG 题 | 工具层零生成（超预算 **0/5**）；LLM/工具 = **0.88**；引用角标 **5/5** | `eval/eval_a1_architecture.py` |
 | 性能 | locust 1–50 并发 + Lighthouse + 资源监控 | 多轮 | 定位 2 个真实瓶颈并修复（见下）；精排过载实验见 `eval/reports/rerank-overload-report.md` | `performance-test/` |
 
-**覆盖率 50%**（`pytest --cov` 口径，只统计产品代码，排除测试脚本 / 评测 / 压测 / 前端产物）。
+**覆盖率 52%**（`pytest --cov` 口径，只统计产品代码，排除测试脚本 / 评测 / 压测 / 前端产物）。
 核心模块显著高于均值：`knowledge/chunker.py` 94%、`dashboard.py` 92%、`memory/memory.py` 83%、`api.py` 69%、`utils/metrics.py` 89%。
 天气 / 热搜 / 网页搜索 / Obsidian 监听这类外部 IO 模块不追求覆盖率——它们由 mock 隔离在单测之外，改由冒烟与压测覆盖真实链路。
 
@@ -575,7 +579,7 @@ async def get_news_async(topic: str) -> str:
 2. **外部服务**：`OBSIDIAN_VAULT_DIR` 置空，避免触发 Obsidian 全量索引与 embedding 模型加载（真实加载一次约 28s）。
 3. **进程内状态**：限流器、Agent 池是模块级内存结构，每个用例前清空，否则注册接口「5 次/分钟」的限制会误伤后续用例。
 
-外部依赖统一用 `tests/fakes.py` 的替身（FakeAgent / FakeVectorStore / FakeLLMResponse）：全程不联网、不加载模型，185 个用例约 96s 跑完（`--no-cov` 时约 45s）。
+外部依赖统一用 `tests/fakes.py` 的替身（FakeAgent / FakeVectorStore / FakeLLMResponse）：全程不联网、不加载模型，209 个用例约 86s 跑完（`--no-cov` 时约 36s）。
 
 ### 压测发现的真实缺陷（已修复，且有回归用例）
 
@@ -611,7 +615,7 @@ pytest tests/test_api.py -v     # 只跑接口层
 pytest -k rate_limit            # 按名字筛选
 ```
 
-首次导入 chromadb / torch 约 10s，之后 154 个用例约 81s 跑完（`--no-cov` 时 35s）。CI 用 `--cov-fail-under=45` 卡门禁。
+首次导入 chromadb / torch 约 10s，之后 209 个用例约 86s 跑完（`--no-cov` 时 36s）。CI 用 `--cov-fail-under=45` 卡门禁。
 
 ---
 
