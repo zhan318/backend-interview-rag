@@ -7,8 +7,21 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_RESULT_LENGTH = 2000
 MAX_NOTE_LENGTH = 4000
+
+# 检索无结果时的统一话术：明确抑制「用通用常识补答个人事务」的倾向
+EMPTY_HINT = (
+    "你的 Obsidian 笔记库中未找到与该问题相关的内容。"
+    "请如实告知用户，不要编造，也不要用通用常识替代笔记内容。"
+)
+
+_SEARCH_DESC = (
+    "在用户的 Obsidian 个人知识库中检索相关笔记的原文片段。"
+    "返回形如「[1] 来源: 路径 + 正文」的片段列表，不是答案——你需要自己从中归纳；"
+    "引用某条片段时在句末标注对应编号，如 [1]。"
+    "当用户询问自己的笔记、个人知识、或 vault 中的主题时使用。"
+    "它与 knowledge_search 是两套独立的知识库，不要混用。"
+)
 
 
 def _resolve_note(note: str) -> Path | None:
@@ -45,46 +58,50 @@ def _resolve_note(note: str) -> Path | None:
     return None
 
 
-@registry.register(
-    description="在用户的 Obsidian 个人知识库中检索并回答关于其笔记内容的问题"
-                "（如学习方法、项目笔记、读书摘抄、个人资料等）。"
-                "当用户询问自己的笔记、个人知识、或 vault 中的主题时使用。"
-                "它与 knowledge_search 是两套独立的知识库，不要混用。"
-)
+@registry.register(description=_SEARCH_DESC)
 def search_obsidian_notes(query: str) -> str:
-    """在 Obsidian 知识库中语义检索并生成答案（同步版）。
+    """在 Obsidian 知识库中检索相关片段（同步版）。
+
+    只做检索，不做生成：返回带编号的原文片段，由主链路统一生成一次答案。
+    （此前这里调用 query_obsidian()，内部已跑过一次完整生成，导致单次问答
+    两次 LLM 调用、来源元数据丢失、答案无法回溯原文。）
 
     Args:
         query: 用户的问题或查询关键词
     """
     logger.info("Obsidian 检索工具被调用: %s", query)
-    from knowledge.pipeline import query_obsidian
+    from knowledge.passages import format_passages
+    from knowledge.pipeline import retrieve_obsidian_passages
 
-    result = query_obsidian(query)
-    if len(result) > MAX_RESULT_LENGTH:
-        result = result[:MAX_RESULT_LENGTH] + "\n\n[回答过长已截断]"
-    return result
+    passages = retrieve_obsidian_passages(query)
+    if not passages:
+        logger.info("Obsidian 检索无命中: %s", query)
+        return EMPTY_HINT
+    logger.info("Obsidian 检索命中 %d 条片段", len(passages))
+    return format_passages(passages)
 
 
-@registry.register_async(
-    description="在用户的 Obsidian 个人知识库中检索并回答关于其笔记内容的问题"
-                "（如学习方法、项目笔记、读书摘抄、个人资料等）。"
-                "当用户询问自己的笔记、个人知识、或 vault 中的主题时使用。"
-                "它与 knowledge_search 是两套独立的知识库，不要混用。"
-)
+@registry.register_async(description=_SEARCH_DESC)
 async def search_obsidian_notes_async(query: str) -> str:
-    """在 Obsidian 知识库中语义检索并生成答案（异步版，Agent.arun 使用）。
+    """在 Obsidian 知识库中检索相关片段（异步版，Agent.arun 使用）。
+
+    检索是 CPU 密集的同步实现（含 Cross-Encoder 精排），放入线程池避免阻塞事件循环。
 
     Args:
         query: 用户的问题或查询关键词
     """
-    logger.info("Obsidian 检索工具被调用(异步): %s", query)
-    from knowledge.pipeline import query_obsidian_async
+    import asyncio
 
-    result = await query_obsidian_async(query)
-    if len(result) > MAX_RESULT_LENGTH:
-        result = result[:MAX_RESULT_LENGTH] + "\n\n[回答过长已截断]"
-    return result
+    logger.info("Obsidian 检索工具被调用(异步): %s", query)
+    from knowledge.passages import format_passages
+    from knowledge.pipeline import retrieve_obsidian_passages
+
+    passages = await asyncio.to_thread(retrieve_obsidian_passages, query)
+    if not passages:
+        logger.info("Obsidian 检索无命中(异步): %s", query)
+        return EMPTY_HINT
+    logger.info("Obsidian 检索命中 %d 条片段(异步)", len(passages))
+    return format_passages(passages)
 
 
 @registry.register(
