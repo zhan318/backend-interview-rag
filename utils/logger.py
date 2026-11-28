@@ -10,17 +10,22 @@ import os
 import sys
 from pathlib import Path
 
-# 日志格式
-_CONSOLE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d: %(message)s"
+from utils.observability import JsonFormatter, ScrubbingFormatter, install_log_context
+
+# 每条日志都带 request_id，并发时才能把一次请求的日志串起来
+_CONSOLE_FORMAT = "%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s: %(message)s"
+_FILE_FORMAT = "%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s:%(lineno)d: %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
+
+# 日志输出格式：text（默认，人类可读）/ json（单行 JSON，供 Loki/ELK 采集）
+_LOG_FORMAT = os.getenv("LOG_FORMAT", "text").strip().lower()
 
 # 日志级别（可用 LOG_LEVEL 环境变量覆盖，如 LOG_LEVEL=DEBUG；非法值回退 INFO）
 _LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").strip().upper(), logging.INFO)
 
 
-class _ColoredFormatter(logging.Formatter):
-    """控制台彩色输出（Windows/Linux 通用）。"""
+class _ColoredFormatter(ScrubbingFormatter):
+    """控制台彩色输出（Windows/Linux 通用）+ 敏感信息脱敏。"""
 
     _COLORS = {
         logging.DEBUG: "\033[36m",      # 青色
@@ -46,11 +51,19 @@ def _setup_root_logger():
     if logger.handlers:
         return  # 避免重复配置
 
+    # 先装 LogRecord 工厂，保证下面创建的 formatter 能取到 %(request_id)s
+    install_log_context()
+
     logger.setLevel(_LOG_LEVEL)
 
-    # 控制台处理器
+    # 控制台处理器（LOG_FORMAT=json 时输出单行 JSON，便于日志平台采集）
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(_ColoredFormatter(_CONSOLE_FORMAT, datefmt=_DATE_FORMAT))
+    if _LOG_FORMAT == "json":
+        console_handler.setFormatter(JsonFormatter())
+    else:
+        console_handler.setFormatter(
+            _ColoredFormatter(_CONSOLE_FORMAT, datefmt=_DATE_FORMAT)
+        )
     logger.addHandler(console_handler)
 
     # 文件处理器（可选，默认不开启）
