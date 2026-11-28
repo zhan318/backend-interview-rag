@@ -418,11 +418,13 @@ class TestHealth:
         assert body["checks"] == {"database": True, "chroma": True}
 
     def test_degraded_when_chroma_unavailable(self, client, monkeypatch):
+        """深度检查（?deep=true）才真正打开 collection；默认轻量检查不碰向量库。"""
+
         def boom(name: str):
             raise RuntimeError("chroma 连接失败")
 
         monkeypatch.setattr("knowledge.vector_store.get_vector_store", boom)
-        body = client.get("/health").json()
+        body = client.get("/health?deep=true").json()
         assert body["status"] == "degraded"
         assert body["checks"]["database"] is True
         assert "chroma 连接失败" in body["checks"]["chroma"]
